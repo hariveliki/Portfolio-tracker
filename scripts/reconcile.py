@@ -1,46 +1,200 @@
 #!/usr/bin/env python3
-"""Reconciliation scaffold."""
+"""Reconcile workbook holdings/cash against current IBKR account values."""
 
 from __future__ import annotations
 
-import json
-import logging
-from datetime import datetime, timezone
+import argparse
+import os
+from dataclasses import dataclass
 from pathlib import Path
 
-
-class JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-        return json.dumps(payload)
+from ib_insync import IB
+from openpyxl import Workbook, load_workbook
+from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
-def configure_logging(log_name: str) -> logging.Logger:
-    log_dir = Path(__file__).resolve().parents[1] / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    logger = logging.getLogger(log_name)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    handler = logging.FileHandler(log_dir / f"{log_name}.log", encoding="utf-8")
-    handler.setFormatter(JsonFormatter())
-    logger.addHandler(handler)
-
-    return logger
+DEFAULT_WORKBOOK = "portfolio_tracker.xlsx"
 
 
-def main() -> int:
-    logger = configure_logging("reconcile")
-    logger.info("Starting reconciliation")
-    logger.info("Reconciliation scaffold complete; implement matching and variance checks")
-    return 0
+@dataclass
+class Row:
+    kind: str
+    item: str
+    workbook: float
+    ibkr: float
+    diff: float
+    tolerance: float
+    within_tolerance: bool
+    notes: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workbook", default=DEFAULT_WORKBOOK)
+    parser.add_argument("--ib-host", default=os.getenv("IB_HOST", "127.0.0.1"))
+    parser.add_argument("--ib-port", type=int, default=int(os.getenv("IB_PORT", "7497")))
+    parser.add_argument("--ib-client-id", type=int, default=int(os.getenv("IB_CLIENT_ID", "16")))
+    parser.add_argument("--cash-tag", default=os.getenv("IB_CASH_TAG", "TotalCashValue"))
+    parser.add_argument("--qty-tol", type=float, default=1e-6)
+    parser.add_argument("--cash-tol", type=float, default=0.01)
+    return parser.parse_args()
+
+
+def table_rows(wb: Workbook, table_name: str) -> list[dict]:
+    for ws in wb.worksheets:
+        if table_name in ws.tables:
+            table = ws.tables[table_name]
+            min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+            values = list(
+                ws.iter_rows(
+                    min_row=min_row,
+                    max_row=max_row,
+                    min_col=min_col,
+                    max_col=max_col,
+                    values_only=True,
+                )
+            )
+            if len(values) < 2:
+                return []
+            headers = values[0]
+            output = []
+            for raw in values[1:]:
+                if not any(v is not None for v in raw):
+                    continue
+                output.append({str(headers[i]): raw[i] for i in range(len(headers))})
+            return output
+    raise ValueError(f"Table '{table_name}' not found")
+
+
+def read_workbook_holdings(wb: Workbook) -> dict[str, float]:
+    rows = table_rows(wb, "tbl_Holdings")
+    holdings: dict[str, float] = {}
+    for row in rows:
+        ticker = str(row.get("Ticker", "")).strip().upper()
+        if not ticker:
+            continue
+        qty = row.get("Quantity", row.get("Qty", row.get("Shares", 0))) or 0
+        holdings[ticker] = float(qty)
+    return holdings
+
+
+def read_workbook_cash(wb: Workbook) -> float:
+    try:
+        rows = table_rows(wb, "tbl_Summary")
+        for row in rows:
+            for k, v in row.items():
+                if "cash" in str(k).lower() and v is not None:
+                    return float(v)
+            if str(row.get("Metric", "")).lower() in {"cash", "cashbalance", "cash balance"}:
+                return float(row.get("Value", 0) or 0)
+    except Exception:
+        pass
+
+    # fallback: named cell and common sheet/cell conventions
+    for defined_name in wb.defined_names.definedName:
+        if "cash" in defined_name.name.lower():
+            ws_name, cell = next(iter(defined_name.destinations))
+            return float((wb[ws_name][cell].value or 0))
+
+    if "Summary" in wb.sheetnames and wb["Summary"]["B2"].value is not None:
+        return float(wb["Summary"]["B2"].value)
+
+    raise ValueError("Unable to locate workbook cash value")
+
+
+def ib_positions_and_cash(args: argparse.Namespace) -> tuple[dict[str, float], float]:
+    ib = IB()
+    ib.connect(args.ib_host, args.ib_port, clientId=args.ib_client_id)
+
+    positions: dict[str, float] = {}
+    for p in ib.positions():
+        ticker = getattr(p.contract, "symbol", "")
+        if ticker:
+            positions[ticker.upper()] = positions.get(ticker.upper(), 0.0) + float(p.position)
+
+    cash_value = None
+    for item in ib.accountSummary():
+        if item.tag == args.cash_tag:
+            cash_value = float(item.value)
+            break
+
+    ib.disconnect()
+
+    if cash_value is None:
+        raise ValueError(f"Cash tag '{args.cash_tag}' not found in account summary")
+    return positions, cash_value
+
+
+def write_reconciliation_sheet(wb: Workbook, rows: list[Row]) -> None:
+    ws = wb["Reconciliation"] if "Reconciliation" in wb.sheetnames else wb.create_sheet("Reconciliation")
+
+    for row in ws.iter_rows(min_row=1, max_row=max(ws.max_row, 1), min_col=1, max_col=max(ws.max_column, 1)):
+        for cell in row:
+            cell.value = None
+
+    headers = ["Type", "Item", "Workbook", "IBKR", "Diff", "Tolerance", "WithinTolerance", "Notes"]
+    ws.append(headers)
+    for r in rows:
+        ws.append([r.kind, r.item, r.workbook, r.ibkr, r.diff, r.tolerance, "Y" if r.within_tolerance else "N", r.notes])
+
+    ref = f"A1:{get_column_letter(len(headers))}{max(len(rows)+1,2)}"
+    if "tbl_Reconciliation" in ws.tables:
+        ws.tables["tbl_Reconciliation"].ref = ref
+    else:
+        table = Table(displayName="tbl_Reconciliation", ref=ref)
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showColumnStripes=False)
+        ws.add_table(table)
+
+
+def main() -> None:
+    args = parse_args()
+    workbook_path = Path(args.workbook)
+    if not workbook_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {workbook_path}")
+
+    wb = load_workbook(workbook_path)
+    wb_holdings = read_workbook_holdings(wb)
+    wb_cash = read_workbook_cash(wb)
+
+    ib_holdings, ib_cash = ib_positions_and_cash(args)
+
+    rows: list[Row] = []
+    for ticker in sorted(set(wb_holdings) | set(ib_holdings)):
+        w_qty = wb_holdings.get(ticker, 0.0)
+        i_qty = ib_holdings.get(ticker, 0.0)
+        diff = w_qty - i_qty
+        rows.append(
+            Row(
+                kind="Position",
+                item=ticker,
+                workbook=w_qty,
+                ibkr=i_qty,
+                diff=diff,
+                tolerance=args.qty_tol,
+                within_tolerance=abs(diff) <= args.qty_tol,
+                notes="" if abs(diff) <= args.qty_tol else "Quantity mismatch",
+            )
+        )
+
+    cash_diff = wb_cash - ib_cash
+    rows.append(
+        Row(
+            kind="Cash",
+            item=args.cash_tag,
+            workbook=wb_cash,
+            ibkr=ib_cash,
+            diff=cash_diff,
+            tolerance=args.cash_tol,
+            within_tolerance=abs(cash_diff) <= args.cash_tol,
+            notes="" if abs(cash_diff) <= args.cash_tol else "Cash mismatch",
+        )
+    )
+
+    write_reconciliation_sheet(wb, rows)
+    wb.save(workbook_path)
+    print(f"Reconciliation updated in {workbook_path}")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
