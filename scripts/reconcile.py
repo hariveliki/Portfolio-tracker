@@ -89,39 +89,32 @@ def table_rows(wb: Workbook, table_name: str) -> list[dict]:
 
 
 def read_workbook_holdings(wb: Workbook) -> dict[str, float]:
-    rows = table_rows(wb, "tbl_Holdings")
+    rows = table_rows(wb, "tbl_Positions")
     holdings: dict[str, float] = {}
     for row in rows:
         ticker = str(row.get("Ticker", "")).strip().upper()
         if not ticker:
             continue
-        qty = row.get("Quantity", row.get("Qty", row.get("Shares", 0))) or 0
+        qty = row.get("Units", row.get("Quantity", row.get("Qty", row.get("Shares", 0)))) or 0
         holdings[ticker] = float(qty)
     return holdings
 
 
 def read_workbook_cash(wb: Workbook) -> float:
-    try:
-        rows = table_rows(wb, "tbl_Summary")
-        for row in rows:
-            for k, v in row.items():
-                if "cash" in str(k).lower() and v is not None:
-                    return float(v)
-            if str(row.get("Metric", "")).lower() in {"cash", "cashbalance", "cash balance"}:
-                return float(row.get("Value", 0) or 0)
-    except Exception:
-        pass
+    rows = table_rows(wb, "tbl_DailyCash")
+    dated_rows: list[tuple[str, float]] = []
+    for row in rows:
+        date_val = row.get("Date")
+        cash_val = row.get("Cash_Balance")
+        if date_val is None or cash_val is None:
+            continue
+        dated_rows.append((str(date_val), float(cash_val)))
 
-    # fallback: named cell and common sheet/cell conventions
-    for defined_name in wb.defined_names.definedName:
-        if "cash" in defined_name.name.lower():
-            ws_name, cell = next(iter(defined_name.destinations))
-            return float((wb[ws_name][cell].value or 0))
+    if not dated_rows:
+        raise ValueError("tbl_DailyCash has no populated Date/Cash_Balance rows")
 
-    if "Summary" in wb.sheetnames and wb["Summary"]["B2"].value is not None:
-        return float(wb["Summary"]["B2"].value)
-
-    raise ValueError("Unable to locate workbook cash value")
+    dated_rows.sort(key=lambda item: item[0])
+    return dated_rows[-1][1]
 
 
 def ib_positions_and_cash(args: argparse.Namespace) -> tuple[dict[str, float], float]:

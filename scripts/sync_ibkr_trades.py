@@ -29,7 +29,7 @@ RAW_COLUMNS = [
     "exchange",
     "currency",
 ]
-FORMULA_COLUMNS = ["Gross_Value", "Net_Cost", "Signed_Shares", "Signed_Gross", "Cash_Balance"]
+FORMULA_COLUMNS = ["Gross_Value", "Net_Cost", "Signed_Shares", "Signed_Cash", "Cash_Balance"]
 
 
 @dataclass
