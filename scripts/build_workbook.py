@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
 from openpyxl import Workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Font, PatternFill
@@ -9,7 +10,17 @@ from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-OUTPUT_PATH = Path("output/Portfolio_BUILT.xlsx")
+DEFAULT_CONFIG_PATH = Path("config/portfolio.yaml")
+DEFAULT_OUTPUT_PATH = Path("output/portfolio_workbook.xlsx")
+
+def load_output_path(config_path: Path = DEFAULT_CONFIG_PATH) -> Path:
+    if not config_path.exists():
+        return DEFAULT_OUTPUT_PATH
+    with config_path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    paths = raw.get("paths", {})
+    return Path(paths.get("workbook_output", str(DEFAULT_OUTPUT_PATH)))
+
 
 SHEETS = [
     "Settings",
@@ -70,7 +81,8 @@ def _apply_pos_neg_cf(ws, start_cell: str, end_cell: str) -> None:
     ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["0"], fill=red))
 
 
-def build_workbook(output_path: Path = OUTPUT_PATH) -> Path:
+def build_workbook(output_path: Path | None = None) -> Path:
+    output_path = output_path or load_output_path()
     wb = Workbook()
     wb.remove(wb.active)
 

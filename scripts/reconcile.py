@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import Any
+
+import yaml
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +17,7 @@ from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
-DEFAULT_WORKBOOK = "portfolio_tracker.xlsx"
+DEFAULT_CONFIG = "config/portfolio.yaml"
 
 
 @dataclass
@@ -29,16 +32,34 @@ class Row:
     notes: str
 
 
+def load_yaml_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        return {}
+    with config_path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workbook", default=DEFAULT_WORKBOOK)
-    parser.add_argument("--ib-host", default=os.getenv("IB_HOST", "127.0.0.1"))
-    parser.add_argument("--ib-port", type=int, default=int(os.getenv("IB_PORT", "7497")))
-    parser.add_argument("--ib-client-id", type=int, default=int(os.getenv("IB_CLIENT_ID", "16")))
+    parser.add_argument("--workbook")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--ib-host")
+    parser.add_argument("--ib-port", type=int)
+    parser.add_argument("--ib-client-id", type=int)
     parser.add_argument("--cash-tag", default=os.getenv("IB_CASH_TAG", "TotalCashValue"))
     parser.add_argument("--qty-tol", type=float, default=1e-6)
     parser.add_argument("--cash-tol", type=float, default=0.01)
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    raw_cfg = load_yaml_config(Path(args.config))
+    ib_cfg = raw_cfg.get("ib", {})
+    path_cfg = raw_cfg.get("paths", {})
+
+    args.workbook = args.workbook or path_cfg.get("workbook_output", "output/portfolio_workbook.xlsx")
+    args.ib_host = args.ib_host or os.getenv("IB_HOST", str(ib_cfg.get("host", "127.0.0.1")))
+    args.ib_port = args.ib_port or int(os.getenv("IB_PORT", str(ib_cfg.get("port", 7497))))
+    args.ib_client_id = args.ib_client_id or int(os.getenv("IB_CLIENT_ID", str(ib_cfg.get("client_id", 16))))
+    return args
 
 
 def table_rows(wb: Workbook, table_name: str) -> list[dict]:
