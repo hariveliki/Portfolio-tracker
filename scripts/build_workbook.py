@@ -101,12 +101,17 @@ def build_workbook(output_path: Path = OUTPUT_PATH) -> Path:
         wb["Trade_Log"],
         "tbl_TradeLog",
         [
-            "Trade_Date",
+            "Date",
+            "IB_ExecId",
             "Ticker",
-            "Side",
+            "Action",
             "Shares",
             "Price",
-            "Fees",
+            "Commission",
+            "permId",
+            "account",
+            "exchange",
+            "currency",
             "Gross_Value",
             "Net_Cost",
             "Signed_Shares",
@@ -120,10 +125,14 @@ def build_workbook(output_path: Path = OUTPUT_PATH) -> Path:
             0,
             0,
             0,
+            "",
+            "",
+            "",
+            "",
             "=[@Shares]*[@Price]",
-            "=[@Gross_Value]+[@Fees]",
-            "=IF(UPPER([@Side])=\"BUY\",[@Shares],-[@Shares])",
-            "=-[@Signed_Shares]*[@Price]-[@Fees]",
+            "=[@Gross_Value]+[@Commission]",
+            "=IF(UPPER([@Action])=\"BUY\",[@Shares],-[@Shares])",
+            "=-[@Signed_Shares]*[@Price]-[@Commission]",
             "=StartCapital+SUM(INDEX(tbl_TradeLog[Signed_Cash],1):[@Signed_Cash])",
         ],
     )
@@ -149,7 +158,7 @@ def build_workbook(output_path: Path = OUTPUT_PATH) -> Path:
         [
             "",
             "",
-            "=SUMIFS(tbl_TradeLog[Signed_Shares],tbl_TradeLog[Ticker],[@Ticker],tbl_TradeLog[Trade_Date],\"<=\"&[@Date])",
+            "=SUMIFS(tbl_TradeLog[Signed_Shares],tbl_TradeLog[Ticker],[@Ticker],tbl_TradeLog[Date],\"<=\"&[@Date])",
         ],
     )
 
@@ -159,7 +168,7 @@ def build_workbook(output_path: Path = OUTPUT_PATH) -> Path:
         ["Date", "Cash_Balance"],
         [
             "",
-            "=StartCapital+SUMIFS(tbl_TradeLog[Signed_Cash],tbl_TradeLog[Trade_Date],\"<=\"&[@Date])",
+            "=StartCapital+SUMIFS(tbl_TradeLog[Signed_Cash],tbl_TradeLog[Date],\"<=\"&[@Date])",
         ],
     )
 
