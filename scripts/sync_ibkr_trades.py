@@ -44,14 +44,14 @@ def load_config(config_path: Path) -> SyncConfig:
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
 
-    ibkr = raw.get("ibkr", {})
-    files = raw.get("files", {})
+    ib = raw.get("ib", {})
+    paths = raw.get("paths", {})
 
     return SyncConfig(
-        host=str(ibkr.get("host", "127.0.0.1")),
-        port=int(ibkr.get("port", 7497)),
-        client_id=int(ibkr.get("client_id", 41)),
-        workbook_path=Path(files.get("trade_log_xlsx", "data/TradeLog.xlsx")),
+        host=str(ib.get("host", "127.0.0.1")),
+        port=int(ib.get("port", 7497)),
+        client_id=int(ib.get("client_id", 41)),
+        workbook_path=Path(paths.get("workbook_output", "output/portfolio_workbook.xlsx")),
     )
 
 

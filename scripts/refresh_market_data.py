@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -12,20 +11,20 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import yaml
 from ib_insync import IB, Stock, util
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
-DEFAULT_WORKBOOK = "portfolio_tracker.xlsx"
-DEFAULT_CONFIG = "config.json"
+DEFAULT_CONFIG = "config/portfolio.yaml"
 
 
 @dataclass
 class RefreshConfig:
     workbook: Path
-    config_path: Path | None
+    config_path: Path
     ib_host: str
     ib_port: int
     ib_client_id: int
@@ -34,27 +33,34 @@ class RefreshConfig:
     yfinance_per_ticker: dict[str, bool]
 
 
+def load_yaml_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        return {}
+    with config_path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
 def parse_args() -> RefreshConfig:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workbook", default=DEFAULT_WORKBOOK)
+    parser.add_argument("--workbook")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument("--ib-host", default=os.getenv("IB_HOST", "127.0.0.1"))
-    parser.add_argument("--ib-port", type=int, default=int(os.getenv("IB_PORT", "7497")))
-    parser.add_argument("--ib-client-id", type=int, default=int(os.getenv("IB_CLIENT_ID", "15")))
+    parser.add_argument("--ib-host")
+    parser.add_argument("--ib-port", type=int)
+    parser.add_argument("--ib-client-id", type=int)
     args = parser.parse_args()
 
     config_path = Path(args.config)
-    raw_cfg: dict[str, Any] = {}
-    if config_path.exists():
-        raw_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    raw_cfg = load_yaml_config(config_path)
+    ib_cfg = raw_cfg.get("ib", {})
+    path_cfg = raw_cfg.get("paths", {})
     fallback_cfg = raw_cfg.get("yfinance_fallback", {})
 
     return RefreshConfig(
-        workbook=Path(args.workbook),
-        config_path=config_path if config_path.exists() else None,
-        ib_host=args.ib_host,
-        ib_port=args.ib_port,
-        ib_client_id=args.ib_client_id,
+        workbook=Path(args.workbook or path_cfg.get("workbook_output", "output/portfolio_workbook.xlsx")),
+        config_path=config_path,
+        ib_host=args.ib_host or os.getenv("IB_HOST", str(ib_cfg.get("host", "127.0.0.1"))),
+        ib_port=args.ib_port or int(os.getenv("IB_PORT", str(ib_cfg.get("port", 7497)))),
+        ib_client_id=args.ib_client_id or int(os.getenv("IB_CLIENT_ID", str(ib_cfg.get("client_id", 15)))),
         yfinance_enabled=bool(fallback_cfg.get("enabled", True)),
         yfinance_default=bool(fallback_cfg.get("default", True)),
         yfinance_per_ticker={k.upper(): bool(v) for k, v in fallback_cfg.get("tickers", {}).items()},
