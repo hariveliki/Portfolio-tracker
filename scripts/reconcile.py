@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconcile workbook holdings/cash against current IBKR account values."""
+"""Reconcile workbook holdings/cash against current IBKR account values via CP REST API."""
 
 from __future__ import annotations
 
@@ -11,10 +11,11 @@ import yaml
 from dataclasses import dataclass
 from pathlib import Path
 
-from ib_insync import IB
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.worksheet.table import Table, TableStyleInfo
+
+from ibkr_client import IbkrClient
 
 
 DEFAULT_CONFIG = "config/portfolio.yaml"
@@ -43,22 +44,26 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workbook")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument("--ib-host")
-    parser.add_argument("--ib-port", type=int)
-    parser.add_argument("--ib-client-id", type=int)
-    parser.add_argument("--cash-tag", default=os.getenv("IB_CASH_TAG", "TotalCashValue"))
+    parser.add_argument("--gateway-url")
+    parser.add_argument("--account-id")
+    parser.add_argument("--cash-tag", default=os.getenv("IB_CASH_TAG", "cashbalance"))
     parser.add_argument("--qty-tol", type=float, default=1e-6)
     parser.add_argument("--cash-tol", type=float, default=0.01)
     args = parser.parse_args()
 
     raw_cfg = load_yaml_config(Path(args.config))
-    ib_cfg = raw_cfg.get("ib", {})
+    cpapi_cfg = raw_cfg.get("cpapi", {})
     path_cfg = raw_cfg.get("paths", {})
 
     args.workbook = args.workbook or path_cfg.get("workbook_output", "output/portfolio_workbook.xlsx")
-    args.ib_host = args.ib_host or os.getenv("IB_HOST", str(ib_cfg.get("host", "127.0.0.1")))
-    args.ib_port = args.ib_port or int(os.getenv("IB_PORT", str(ib_cfg.get("port", 7497))))
-    args.ib_client_id = args.ib_client_id or int(os.getenv("IB_CLIENT_ID", str(ib_cfg.get("client_id", 16))))
+    args.gateway_url = args.gateway_url or os.getenv(
+        "CPAPI_GATEWAY_URL",
+        str(cpapi_cfg.get("gateway_url", "https://localhost:5001/v1/api")),
+    )
+    args.account_id = args.account_id or os.getenv(
+        "CPAPI_ACCOUNT_ID",
+        str(cpapi_cfg.get("account_id", "")),
+    )
     return args
 
 
@@ -117,26 +122,38 @@ def read_workbook_cash(wb: Workbook) -> float:
     return dated_rows[-1][1]
 
 
-def ib_positions_and_cash(args: argparse.Namespace) -> tuple[dict[str, float], float]:
-    ib = IB()
-    ib.connect(args.ib_host, args.ib_port, clientId=args.ib_client_id)
+def ib_positions_and_cash(client: IbkrClient, cash_tag: str) -> tuple[dict[str, float], float]:
+    account_id = client.resolve_account_id()
+
+    client.get_accounts()
 
     positions: dict[str, float] = {}
-    for p in ib.positions():
-        ticker = getattr(p.contract, "symbol", "")
-        if ticker:
-            positions[ticker.upper()] = positions.get(ticker.upper(), 0.0) + float(p.position)
-
-    cash_value = None
-    for item in ib.accountSummary():
-        if item.tag == args.cash_tag:
-            cash_value = float(item.value)
+    page = 0
+    while True:
+        page_data = client.get_positions(account_id, page=page)
+        if not page_data:
             break
+        for p in page_data:
+            ticker = str(p.get("ticker", p.get("contractDesc", ""))).strip().upper()
+            if ticker:
+                positions[ticker] = positions.get(ticker, 0.0) + float(p.get("position", 0))
+        if len(page_data) < 100:
+            break
+        page += 1
 
-    ib.disconnect()
+    ledger = client.get_account_ledger(account_id)
+    cash_value: float | None = None
+    base_entry = ledger.get("BASE", {})
+    if cash_tag in base_entry:
+        cash_value = float(base_entry[cash_tag])
+    else:
+        for currency_data in ledger.values():
+            if isinstance(currency_data, dict) and cash_tag in currency_data:
+                cash_value = float(currency_data[cash_tag])
+                break
 
     if cash_value is None:
-        raise ValueError(f"Cash tag '{args.cash_tag}' not found in account summary")
+        raise ValueError(f"Cash field '{cash_tag}' not found in account ledger")
     return positions, cash_value
 
 
@@ -171,7 +188,9 @@ def main() -> None:
     wb_holdings = read_workbook_holdings(wb)
     wb_cash = read_workbook_cash(wb)
 
-    ib_holdings, ib_cash = ib_positions_and_cash(args)
+    with IbkrClient(base_url=args.gateway_url, account_id=args.account_id) as client:
+        client.check_auth()
+        ib_holdings, ib_cash = ib_positions_and_cash(client, args.cash_tag)
 
     rows: list[Row] = []
     for ticker in sorted(set(wb_holdings) | set(ib_holdings)):

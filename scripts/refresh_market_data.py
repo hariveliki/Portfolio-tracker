@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Refresh market data table in the workbook from IBKR (with optional yfinance fallback)."""
+"""Refresh market data table in the workbook from IBKR CP API (with optional yfinance fallback)."""
 
 from __future__ import annotations
 
 import argparse
 import os
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import yaml
-from ib_insync import IB, Stock, util
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.worksheet.table import Table, TableStyleInfo
+
+from ibkr_client import IbkrClient
 
 
 DEFAULT_CONFIG = "config/portfolio.yaml"
@@ -25,9 +26,8 @@ DEFAULT_CONFIG = "config/portfolio.yaml"
 class RefreshConfig:
     workbook: Path
     config_path: Path
-    ib_host: str
-    ib_port: int
-    ib_client_id: int
+    gateway_url: str
+    account_id: str
     yfinance_enabled: bool
     yfinance_default: bool
     yfinance_per_ticker: dict[str, bool]
@@ -44,23 +44,27 @@ def parse_args() -> RefreshConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workbook")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument("--ib-host")
-    parser.add_argument("--ib-port", type=int)
-    parser.add_argument("--ib-client-id", type=int)
+    parser.add_argument("--gateway-url")
+    parser.add_argument("--account-id")
     args = parser.parse_args()
 
     config_path = Path(args.config)
     raw_cfg = load_yaml_config(config_path)
-    ib_cfg = raw_cfg.get("ib", {})
+    cpapi_cfg = raw_cfg.get("cpapi", {})
     path_cfg = raw_cfg.get("paths", {})
     fallback_cfg = raw_cfg.get("yfinance_fallback", {})
 
     return RefreshConfig(
         workbook=Path(args.workbook or path_cfg.get("workbook_output", "output/portfolio_workbook.xlsx")),
         config_path=config_path,
-        ib_host=args.ib_host or os.getenv("IB_HOST", str(ib_cfg.get("host", "127.0.0.1"))),
-        ib_port=args.ib_port or int(os.getenv("IB_PORT", str(ib_cfg.get("port", 7497)))),
-        ib_client_id=args.ib_client_id or int(os.getenv("IB_CLIENT_ID", str(ib_cfg.get("client_id", 15)))),
+        gateway_url=args.gateway_url or os.getenv(
+            "CPAPI_GATEWAY_URL",
+            str(cpapi_cfg.get("gateway_url", "https://localhost:5001/v1/api")),
+        ),
+        account_id=args.account_id or os.getenv(
+            "CPAPI_ACCOUNT_ID",
+            str(cpapi_cfg.get("account_id", "")),
+        ),
         yfinance_enabled=bool(fallback_cfg.get("enabled", True)),
         yfinance_default=bool(fallback_cfg.get("default", True)),
         yfinance_per_ticker={k.upper(): bool(v) for k, v in fallback_cfg.get("tickers", {}).items()},
@@ -106,26 +110,32 @@ def extract_tickers_and_start(df: pd.DataFrame) -> tuple[list[str], date]:
     return tickers, start_date
 
 
-def fetch_ib_series(ib: IB, ticker: str, start_date: date) -> pd.DataFrame:
-    contract = Stock(ticker, "SMART", "USD")
-    ib.qualifyContracts(contract)
+def fetch_cpapi_series(client: IbkrClient, ticker: str, start_date: date, conid_cache: dict[str, int]) -> pd.DataFrame:
+    if ticker not in conid_cache:
+        conid_cache[ticker] = client.resolve_conid(ticker)
+    conid = conid_cache[ticker]
+
     duration_days = max((date.today() - start_date).days + 5, 10)
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime="",
-        durationStr=f"{duration_days} D",
-        barSizeSetting="1 day",
-        whatToShow="ADJUSTED_LAST",
-        useRTH=True,
-        formatDate=1,
-    )
-    df = util.df(bars)
-    if df.empty:
-        return df
-    df = df[["date", "close"]].copy()
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    df = df[df["date"] >= start_date]
-    return df.rename(columns={"close": ticker})
+    period = f"{min(duration_days, 1000)}d"
+
+    data = client.get_market_history(conid, period=period, bar="1d")
+    bars = data.get("data", [])
+    if not bars:
+        return pd.DataFrame()
+
+    records = []
+    for bar in bars:
+        ts = bar.get("t")
+        close = bar.get("c")
+        if ts is None or close is None:
+            continue
+        dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date()
+        if dt >= start_date:
+            records.append({"date": dt, ticker: close})
+
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records)
 
 
 def fetch_yf_series(ticker: str, start_date: date) -> pd.DataFrame:
@@ -197,28 +207,28 @@ def main() -> None:
     trade_df, _, _ = read_table_dataframe(wb, "tbl_TradeLog")
     tickers, start_date = extract_tickers_and_start(trade_df)
 
-    ib = IB()
-    ib.connect(cfg.ib_host, cfg.ib_port, clientId=cfg.ib_client_id)
-
+    conid_cache: dict[str, int] = {}
     merged: pd.DataFrame | None = None
-    for ticker in tickers:
-        series = pd.DataFrame()
-        try:
-            series = fetch_ib_series(ib, ticker, start_date)
-        except Exception as exc:
-            print(f"IB fetch failed for {ticker}: {exc}")
 
-        if series.empty and should_use_yf(cfg, ticker):
-            print(f"Using yfinance fallback for {ticker}")
-            series = fetch_yf_series(ticker, start_date)
+    with IbkrClient(base_url=cfg.gateway_url, account_id=cfg.account_id) as client:
+        client.check_auth()
 
-        if series.empty:
-            print(f"No market data fetched for {ticker}")
-            continue
+        for ticker in tickers:
+            series = pd.DataFrame()
+            try:
+                series = fetch_cpapi_series(client, ticker, start_date, conid_cache)
+            except Exception as exc:
+                print(f"CP API fetch failed for {ticker}: {exc}")
 
-        merged = series if merged is None else merged.merge(series, on="date", how="outer")
+            if series.empty and should_use_yf(cfg, ticker):
+                print(f"Using yfinance fallback for {ticker}")
+                series = fetch_yf_series(ticker, start_date)
 
-    ib.disconnect()
+            if series.empty:
+                print(f"No market data fetched for {ticker}")
+                continue
+
+            merged = series if merged is None else merged.merge(series, on="date", how="outer")
 
     if merged is None:
         merged = pd.DataFrame(columns=["date"])

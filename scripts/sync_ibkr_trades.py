@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync IBKR executions into the TradeLog workbook."""
+"""Sync IBKR executions into the TradeLog workbook via Client Portal REST API."""
 
 from __future__ import annotations
 
@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from ib_insync import ExecutionFilter, IB
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.worksheet.table import Table
+
+from ibkr_client import IbkrClient
 
 RAW_COLUMNS = [
     "IB_ExecId",
@@ -34,9 +35,8 @@ FORMULA_COLUMNS = ["Gross_Value", "Net_Cost", "Signed_Shares", "Signed_Cash", "C
 
 @dataclass
 class SyncConfig:
-    host: str
-    port: int
-    client_id: int
+    gateway_url: str
+    account_id: str
     workbook_path: Path
 
 
@@ -44,13 +44,12 @@ def load_config(config_path: Path) -> SyncConfig:
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
 
-    ib = raw.get("ib", {})
+    cpapi = raw.get("cpapi", {})
     paths = raw.get("paths", {})
 
     return SyncConfig(
-        host=str(ib.get("host", "127.0.0.1")),
-        port=int(ib.get("port", 7497)),
-        client_id=int(ib.get("client_id", 41)),
+        gateway_url=str(cpapi.get("gateway_url", "https://localhost:5001/v1/api")),
+        account_id=str(cpapi.get("account_id", "")),
         workbook_path=Path(paths.get("workbook_output", "output/portfolio_workbook.xlsx")),
     )
 
@@ -69,32 +68,12 @@ def save_state(state_path: Path, state: dict[str, Any]) -> None:
         handle.write("\n")
 
 
-def format_execution_filter_time(last_sync_utc: str | None) -> str | None:
-    if not last_sync_utc:
-        return None
-    stamp = datetime.fromisoformat(last_sync_utc.replace("Z", "+00:00")).astimezone(UTC)
-    return stamp.strftime("%Y%m%d %H:%M:%S")
-
-
-def normalize_trading_date(fill: Any) -> str:
-    candidates = [
-        getattr(fill.execution, "time", None),
-        getattr(fill.execution, "execTime", None),
-        getattr(fill, "time", None),
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        if isinstance(candidate, datetime):
-            return candidate.astimezone(UTC).date().isoformat()
-        try:
-            parsed = datetime.fromisoformat(str(candidate).replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                return parsed.date().isoformat()
-            return parsed.astimezone(UTC).date().isoformat()
-        except ValueError:
-            continue
-    return datetime.now(tz=UTC).date().isoformat()
+def parse_trade_time(trade_time: str) -> str:
+    try:
+        dt = datetime.strptime(trade_time, "%Y%m%d-%H:%M:%S")
+        return dt.date().isoformat()
+    except ValueError:
+        return datetime.now(tz=UTC).date().isoformat()
 
 
 def find_trade_table(workbook_path: Path, table_name: str = "tbl_TradeLog") -> tuple[Any, Worksheet, Table]:
@@ -130,22 +109,19 @@ def existing_exec_ids(ws: Worksheet, headers: list[str], start_col: int, start_r
     return values
 
 
-def map_fill(fill: Any) -> dict[str, Any]:
-    commission_report = getattr(fill, "commissionReport", None)
-    execution = fill.execution
-    contract = fill.contract
+def map_trade(trade: dict[str, Any]) -> dict[str, Any]:
     return {
-        "IB_ExecId": execution.execId,
-        "Date": normalize_trading_date(fill),
-        "Ticker": contract.symbol,
-        "Action": execution.side,
-        "Shares": execution.shares,
-        "Price": execution.price,
-        "Commission": getattr(commission_report, "commission", 0) if commission_report else 0,
-        "permId": getattr(execution, "permId", None),
-        "account": getattr(execution, "acctNumber", None),
-        "exchange": getattr(execution, "exchange", None),
-        "currency": getattr(contract, "currency", None),
+        "IB_ExecId": trade.get("execution_id", ""),
+        "Date": parse_trade_time(trade.get("trade_time", "")),
+        "Ticker": trade.get("symbol", ""),
+        "Action": trade.get("side", ""),
+        "Shares": trade.get("size", 0),
+        "Price": float(trade.get("price", 0)),
+        "Commission": float(trade.get("commission", 0)),
+        "permId": None,
+        "account": trade.get("account", ""),
+        "exchange": trade.get("exchange", ""),
+        "currency": None,
     }
 
 
@@ -206,42 +182,37 @@ def main() -> None:
     state_path = root / "state" / "state.json"
     state = load_state(state_path)
 
-    ib = IB()
-    max_seen_ts: datetime | None = None
+    with IbkrClient(base_url=config.gateway_url, account_id=config.account_id) as client:
+        client.check_auth()
 
-    try:
-        ib.connect(config.host, config.port, clientId=config.client_id, readonly=True)
-
-        filter_time = format_execution_filter_time(state.get("last_sync_utc"))
-        execution_filter = ExecutionFilter(time=filter_time) if filter_time else ExecutionFilter()
-
-        fills = ib.reqExecutions(execution_filter)
-        mapped = [map_fill(fill) for fill in fills]
+        trades = client.get_trades(days=7)
+        mapped = [map_trade(t) for t in trades]
 
         wb, ws, table = find_trade_table(config.workbook_path)
         headers, start_col, start_row, _, end_row = read_table_headers(ws, table)
-        existing_ids = existing_exec_ids(ws, headers, start_col, start_row, end_row)
+        known_ids = existing_exec_ids(ws, headers, start_col, start_row, end_row)
         wb.close()
 
         new_rows: list[dict[str, Any]] = []
-        for fill, row in zip(fills, mapped):
+        max_epoch: int = 0
+        for trade, row in zip(trades, mapped):
             exec_id = str(row["IB_ExecId"])
-            if exec_id in existing_ids:
+            if exec_id in known_ids:
                 continue
             new_rows.append(row)
-            exec_time = getattr(fill.execution, "time", None)
-            if isinstance(exec_time, datetime):
-                time_obj = exec_time if exec_time.tzinfo else exec_time.replace(tzinfo=UTC)
-                max_seen_ts = time_obj.astimezone(UTC) if not max_seen_ts else max(max_seen_ts, time_obj.astimezone(UTC))
+            epoch = trade.get("trade_time_r", 0)
+            if isinstance(epoch, int) and epoch > max_epoch:
+                max_epoch = epoch
 
         inserted = append_rows(config.workbook_path, new_rows)
 
         if inserted > 0:
-            state["last_sync_utc"] = (max_seen_ts or datetime.now(tz=UTC)).isoformat().replace("+00:00", "Z")
+            if max_epoch:
+                ts = datetime.fromtimestamp(max_epoch / 1000, tz=UTC)
+            else:
+                ts = datetime.now(tz=UTC)
+            state["last_sync_utc"] = ts.isoformat().replace("+00:00", "Z")
             save_state(state_path, state)
-    finally:
-        if ib.isConnected():
-            ib.disconnect()
 
 
 if __name__ == "__main__":
