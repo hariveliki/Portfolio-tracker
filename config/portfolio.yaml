@@ -1,6 +1,8 @@
-cpapi:
-  gateway_url: "https://localhost:5001/v1/api"
-  account_id: ""
+ib:
+  host: "127.0.0.1"
+  port: 4001
+  client_id: 1
+  readonly: true
 
 portfolio:
   start_date: "2020-01-01"
