@@ -92,15 +92,15 @@ def _read_setting(wb, param_name: str, default: Any = None) -> Any:
 
 
 def _clear_sheet(ws, max_col_override: int | None = None) -> None:
+    for merge in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(merge))
     max_col = max_col_override or max(ws.max_column, 1)
     for row in ws.iter_rows(min_row=1, max_row=max(ws.max_row, 1), min_col=1, max_col=max_col):
         for cell in row:
             cell.value = None
     for tname in list(ws.tables.keys()):
         del ws.tables[tname]
-    for merge in list(ws.merged_cells.ranges):
-        ws.unmerge_cells(str(merge))
-    ws.conditional_formatting._cf_rules = []
+    ws.conditional_formatting._cf_rules = {}
 
 
 def _write_table(ws, table_name: str, headers: list[str], rows: list[list],
