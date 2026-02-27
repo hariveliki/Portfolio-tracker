@@ -162,7 +162,7 @@ def _prepare_trades(raw: pd.DataFrame) -> pd.DataFrame:
     df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
     df = df[df["Ticker"].ne("")]
     df["Signed_Shares"] = df.apply(
-        lambda r: r["Shares"] if str(r["Action"]).upper() == "BUY" else -r["Shares"], axis=1,
+        lambda r: r["Shares"] if str(r["Action"]).upper() in ("BUY", "BOT") else -r["Shares"], axis=1,
     )
     df["Signed_Cash"] = -df["Signed_Shares"] * df["Price"] - df["Commission"]
     return df

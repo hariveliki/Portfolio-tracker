@@ -137,7 +137,7 @@ def map_fill(fill: Any) -> dict[str, Any]:
         "IB_ExecId": execution.execId,
         "Date": normalize_trading_date(fill),
         "Ticker": contract.symbol,
-        "Action": execution.side,
+        "Action": "BUY" if execution.side in ("BOT", "BUY") else "SELL",
         "Shares": execution.shares,
         "Price": execution.price,
         "Commission": getattr(commission_report, "commission", 0) if commission_report else 0,

@@ -139,8 +139,8 @@ def build_workbook(output_path: Path | None = None) -> Path:
         [
             "", "", "", "", 0, 0, 0, "", "", "", "",
             "=[@Shares]*[@Price]",
-            "=[@Gross_Value]+[@Commission]",
-            '=IF(UPPER([@Action])="BUY",[@Shares],-[@Shares])',
+            '=IF(OR(UPPER([@Action])="BUY",UPPER([@Action])="BOT"),[@Gross_Value]+[@Commission],[@Gross_Value]-[@Commission])',
+            '=IF(OR(UPPER([@Action])="BUY",UPPER([@Action])="BOT"),[@Shares],-[@Shares])',
             "=-[@Signed_Shares]*[@Price]-[@Commission]",
             "=StartCapital+SUM(INDEX(tbl_TradeLog[Signed_Cash],1):[@Signed_Cash])",
         ],

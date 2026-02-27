@@ -129,8 +129,8 @@ def fetch_ib_series(ib: IB, ticker: str, start_date: date) -> pd.DataFrame:
         formatDate=1,
     )
     df = util.df(bars)
-    if df.empty:
-        return df
+    if df is None or df.empty:
+        return pd.DataFrame()
     df = df[["date", "open", "high", "low", "close", "volume"]].copy()
     df.columns = ["Date", "Open", "High", "Low", "Close", "Volume"]
     df["Date"] = pd.to_datetime(df["Date"]).dt.date
