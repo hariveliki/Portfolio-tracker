@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Fetch reference data (name, sector, industry, region, currency, beta) for each ticker via yfinance."""
+"""Fetch reference data with yfinance primary and IBKR fallback."""
 
 from __future__ import annotations
 
 import argparse
+import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 import yfinance as yf
+from ib_insync import IB, Stock
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter, range_boundaries
@@ -26,6 +29,14 @@ TABLE_STYLE = TableStyleInfo(
 )
 
 
+@dataclass
+class RefreshConfig:
+    workbook: Path
+    ib_host: str
+    ib_port: int
+    ib_client_id: int
+
+
 def load_yaml_config(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         return {}
@@ -33,16 +44,24 @@ def load_yaml_config(config_path: Path) -> dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> RefreshConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workbook")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--ib-host")
+    parser.add_argument("--ib-port", type=int)
+    parser.add_argument("--ib-client-id", type=int)
     args = parser.parse_args()
 
     raw_cfg = load_yaml_config(Path(args.config))
+    ib_cfg = raw_cfg.get("ib", {})
     path_cfg = raw_cfg.get("paths", {})
-    args.workbook = args.workbook or path_cfg.get("workbook_output", "output/portfolio_workbook.xlsx")
-    return args
+    return RefreshConfig(
+        workbook=Path(args.workbook or path_cfg.get("workbook_output", "output/portfolio_workbook.xlsx")),
+        ib_host=args.ib_host or os.getenv("IB_HOST", str(ib_cfg.get("host", "127.0.0.1"))),
+        ib_port=args.ib_port or int(os.getenv("IB_PORT", str(ib_cfg.get("port", 7497)))),
+        ib_client_id=args.ib_client_id or int(os.getenv("IB_CLIENT_ID", str(ib_cfg.get("client_id", 16)))),
+    )
 
 
 def extract_tickers(wb) -> list[str]:
@@ -70,14 +89,26 @@ def extract_tickers(wb) -> list[str]:
     return []
 
 
-def fetch_reference(ticker: str) -> dict[str, Any]:
+def _blank_row(ticker: str) -> dict[str, Any]:
+    return {"Ticker": ticker, "Name": "", "Sector": "", "Industry": "", "Region": "", "Currency": "", "Beta": ""}
+
+
+def _needs_ib_fallback(row: dict[str, Any]) -> bool:
+    # If both identity and currency are missing, yfinance was not useful.
+    return not row.get("Name") and not row.get("Currency")
+
+
+def fetch_reference_yf(ticker: str) -> dict[str, Any]:
     try:
         info = yf.Ticker(ticker).info
     except Exception as exc:
         print(f"  Warning: yfinance lookup failed for {ticker}: {exc}")
-        return {"Ticker": ticker, "Name": "", "Sector": "", "Industry": "", "Region": "", "Currency": "", "Beta": ""}
+        return _blank_row(ticker)
 
-    return {
+    if not isinstance(info, dict) or not info:
+        return _blank_row(ticker)
+
+    row = {
         "Ticker": ticker,
         "Name": info.get("longName") or info.get("shortName", ""),
         "Sector": info.get("sector", ""),
@@ -85,6 +116,28 @@ def fetch_reference(ticker: str) -> dict[str, Any]:
         "Region": info.get("country", ""),
         "Currency": info.get("currency", ""),
         "Beta": info.get("beta") if info.get("beta") is not None else "",
+    }
+    return row
+
+
+def fetch_reference_ibkr(ib: IB, ticker: str) -> dict[str, Any]:
+    contract = Stock(ticker, "SMART", "USD")
+    ib.qualifyContracts(contract)
+    details = ib.reqContractDetails(contract)
+    if not details:
+        return _blank_row(ticker)
+
+    detail = details[0]
+    # IBKR uses CUSIP-like market names; keep mapping conservative and stable.
+    region = detail.contract.primaryExchange or detail.contract.exchange or ""
+    return {
+        "Ticker": ticker,
+        "Name": detail.longName or "",
+        "Sector": detail.industry or "",
+        "Industry": detail.category or detail.subcategory or "",
+        "Region": region,
+        "Currency": detail.contract.currency or "",
+        "Beta": "",
     }
 
 
@@ -136,8 +189,8 @@ def write_reference_table(wb, rows: list[dict[str, Any]], table_name: str = "tbl
 
 
 def main() -> None:
-    args = parse_args()
-    workbook_path = Path(args.workbook)
+    cfg = parse_args()
+    workbook_path = Path(cfg.workbook)
     if not workbook_path.exists():
         raise FileNotFoundError(f"Workbook not found: {workbook_path}")
 
@@ -150,9 +203,37 @@ def main() -> None:
 
     print(f"Fetching reference data for {len(tickers)} tickers...")
     rows = []
+    ib = IB()
+    ib_connected = False
     for ticker in tickers:
         print(f"  {ticker}...")
-        rows.append(fetch_reference(ticker))
+        row = fetch_reference_yf(ticker)
+        if _needs_ib_fallback(row):
+            print(f"    yfinance incomplete for {ticker}; trying IBKR fallback")
+            if not ib_connected:
+                try:
+                    ib.connect(cfg.ib_host, cfg.ib_port, clientId=cfg.ib_client_id)
+                    ib_connected = True
+                except Exception as exc:
+                    print(f"    Warning: failed to connect to IBKR for fallback: {exc}")
+            if ib_connected:
+                try:
+                    ib_row = fetch_reference_ibkr(ib, ticker)
+                    row = {
+                        "Ticker": ticker,
+                        "Name": row.get("Name") or ib_row.get("Name", ""),
+                        "Sector": row.get("Sector") or ib_row.get("Sector", ""),
+                        "Industry": row.get("Industry") or ib_row.get("Industry", ""),
+                        "Region": row.get("Region") or ib_row.get("Region", ""),
+                        "Currency": row.get("Currency") or ib_row.get("Currency", ""),
+                        "Beta": row.get("Beta") if row.get("Beta") not in (None, "") else ib_row.get("Beta", ""),
+                    }
+                except Exception as exc:
+                    print(f"    Warning: IBKR fallback failed for {ticker}: {exc}")
+        rows.append(row)
+
+    if ib_connected:
+        ib.disconnect()
 
     write_reference_table(wb, rows)
     wb.save(workbook_path)

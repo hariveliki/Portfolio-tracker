@@ -194,11 +194,12 @@ def compute_daily_units(trades: pd.DataFrame, trading_dates: list[date]) -> pd.D
 
     trade_events = trades.groupby(["Date", "Ticker"])["Signed_Shares"].sum().reset_index()
     tickers = sorted(trade_events["Ticker"].unique())
+    first_td = trading_dates[0]
 
     results: list[dict] = []
     for ticker in tickers:
         t_events = trade_events[trade_events["Ticker"] == ticker].set_index("Date")["Signed_Shares"]
-        cumulative = 0.0
+        cumulative = float(t_events[t_events.index < first_td].sum())
         for d in trading_dates:
             if d in t_events.index:
                 cumulative += t_events[d]
@@ -215,6 +216,9 @@ def compute_daily_cash(trades: pd.DataFrame, trading_dates: list[date], start_ca
     cash_events = trades.groupby("Date")["Signed_Cash"].sum() if not trades.empty else pd.Series(dtype=float)
 
     balance = start_capital
+    if not cash_events.empty:
+        balance += float(cash_events[cash_events.index < trading_dates[0]].sum())
+
     rows: list[dict] = []
     for d in trading_dates:
         if d in cash_events.index:
@@ -332,16 +336,16 @@ def _write_positions(wb, positions: pd.DataFrame) -> None:
         "Day_Change_Pct", "Cost_Basis", "Market_Value", "Unrealized_PnL", "PnL_Pct", "Weight",
     ]
     rows = []
-    for _, p in positions.iterrows():
+    for row_idx, (_, p) in enumerate(positions.iterrows(), start=2):
         rows.append([
             p["Ticker"], p["Company"], p["Sector"], p["Region"],
             p["Units"], round(p["Avg_Cost"], 4), round(p["Last_Price"], 4),
             p.get("Day_Change_Pct", 0),
-            "=[@Units]*[@Avg_Cost]",
-            "=[@Units]*[@Last_Price]",
-            "=[@Market_Value]-[@Cost_Basis]",
-            "=IFERROR([@Unrealized_PnL]/[@Cost_Basis],0)",
-            "=IFERROR([@Market_Value]/SUM(tbl_Positions[Market_Value]),0)",
+            f"=E{row_idx}*F{row_idx}",
+            f"=E{row_idx}*G{row_idx}",
+            f"=J{row_idx}-I{row_idx}",
+            f"=IFERROR(K{row_idx}/I{row_idx},0)",
+            f"=IFERROR(J{row_idx}/SUM($J:$J),0)",
         ])
 
     fmt = {5: "#,##0.00", 6: "#,##0.00", 7: "#,##0.00", 8: "0.00%",
@@ -361,16 +365,16 @@ def _write_equity_curve(wb, eq_curve: pd.DataFrame) -> None:
         "Cumulative_Return", "Peak_NAV", "Drawdown",
     ]
     rows = []
-    for _, r in eq_curve.iterrows():
+    for row_idx, (_, r) in enumerate(eq_curve.iterrows(), start=2):
         rows.append([
             r["Date"],
             r["Portfolio_Value"],
             r["Cash_Balance"],
-            "=[@Portfolio_Value]+[@Cash_Balance]",
-            "=IFERROR([@NAV]/OFFSET([@NAV],-1,0)-1,0)",
-            "=IFERROR([@NAV]/INDEX(tbl_EquityCurve[NAV],1)-1,0)",
-            "=MAX(INDEX(tbl_EquityCurve[NAV],1):[@NAV])",
-            "=IFERROR([@NAV]/[@Peak_NAV]-1,0)",
+            f"=B{row_idx}+C{row_idx}",
+            f"=IFERROR(D{row_idx}/D{row_idx-1}-1,0)",
+            f"=IFERROR(D{row_idx}/$D$2-1,0)",
+            f"=MAX($D$2:D{row_idx})",
+            f"=IFERROR(D{row_idx}/G{row_idx}-1,0)",
         ])
 
     fmt = {2: "#,##0.00", 3: "#,##0.00", 4: "#,##0.00",
@@ -390,11 +394,11 @@ def _write_sector_exposure(wb, positions: pd.DataFrame) -> None:
     if not positions.empty:
         sectors = sorted(positions["Sector"].dropna().unique())
         sectors = [s for s in sectors if s]
-        for sector in sectors:
+        for row_idx, sector in enumerate(sectors, start=2):
             rows.append([
                 sector,
-                '=SUMIFS(tbl_Positions[Market_Value],tbl_Positions[Sector],[@Sector])',
-                "=IFERROR([@Market_Value]/SUM(tbl_SectorExposure[Market_Value]),0)",
+                f"=SUMIFS(Positions!$J:$J,Positions!$C:$C,A{row_idx})",
+                f"=IFERROR(B{row_idx}/SUM($B:$B),0)",
             ])
 
     fmt = {2: "#,##0.00", 3: "0.00%"}
@@ -410,11 +414,11 @@ def _write_geo_exposure(wb, positions: pd.DataFrame) -> None:
     if not positions.empty:
         regions = sorted(positions["Region"].dropna().unique())
         regions = [r for r in regions if r]
-        for region in regions:
+        for row_idx, region in enumerate(regions, start=2):
             rows.append([
                 region,
-                '=SUMIFS(tbl_Positions[Market_Value],tbl_Positions[Region],[@Region])',
-                "=IFERROR([@Market_Value]/SUM(tbl_GeoExposure[Market_Value]),0)",
+                f"=SUMIFS(Positions!$J:$J,Positions!$D:$D,A{row_idx})",
+                f"=IFERROR(B{row_idx}/SUM($B:$B),0)",
             ])
 
     fmt = {2: "#,##0.00", 3: "0.00%"}
@@ -441,18 +445,18 @@ def _write_dashboard(wb, eq_curve: pd.DataFrame, positions: pd.DataFrame,
     ws["B2"].alignment = Alignment(horizontal="left")
 
     kpis = [
-        ("NAV", "=IFERROR(TAKE(tbl_EquityCurve[NAV],-1),0)", "#,##0.00"),
-        ("Total Return", "=IFERROR(TAKE(tbl_EquityCurve[Cumulative_Return],-1),0)", "0.00%"),
-        ("Daily Return", "=IFERROR(TAKE(tbl_EquityCurve[Daily_Return],-1),0)", "0.00%"),
+        ("NAV", '=IFERROR(LOOKUP(2,1/(Equity_Curve!$D:$D<>""),Equity_Curve!$D:$D),0)', "#,##0.00"),
+        ("Total Return", '=IFERROR(LOOKUP(2,1/(Equity_Curve!$F:$F<>""),Equity_Curve!$F:$F),0)', "0.00%"),
+        ("Daily Return", '=IFERROR(LOOKUP(2,1/(Equity_Curve!$E:$E<>""),Equity_Curve!$E:$E),0)', "0.00%"),
         (
             "Sharpe Ratio",
-            "=IFERROR((AVERAGE(tbl_EquityCurve[Daily_Return])*252-RiskFreeRate)"
-            "/(STDEV(tbl_EquityCurve[Daily_Return])*SQRT(252)),0)",
+            "=IFERROR((AVERAGE(Equity_Curve!$E:$E)*252-RiskFreeRate)"
+            "/(STDEV(Equity_Curve!$E:$E)*SQRT(252)),0)",
             "0.00",
         ),
-        ("Max Drawdown", "=IFERROR(MIN(tbl_EquityCurve[Drawdown]),0)", "0.00%"),
-        ("VaR (95% Daily)", "=IFERROR(PERCENTILE(tbl_EquityCurve[Daily_Return],0.05),0)", "0.00%"),
-        ('# Positions', '=COUNTIF(tbl_Positions[Units],">"&0)', "0"),
+        ("Max Drawdown", "=IFERROR(MIN(Equity_Curve!$H:$H),0)", "0.00%"),
+        ("VaR (95% Daily)", "=IFERROR(PERCENTILE(Equity_Curve!$E:$E,0.05),0)", "0.00%"),
+        ('# Positions', '=COUNTIF(Positions!$E:$E,">0")', "0"),
         ("Start Date", "=StartDate", "@"),
     ]
 

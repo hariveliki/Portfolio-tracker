@@ -42,6 +42,12 @@ class RefreshConfig:
     yfinance_per_ticker: dict[str, bool]
 
 
+@dataclass
+class ContractHint:
+    exchange: str
+    currency: str
+
+
 def load_yaml_config(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         return {}
@@ -96,48 +102,103 @@ def read_table_dataframe(wb: Workbook, table_name: str) -> tuple[pd.DataFrame, A
     raise ValueError(f"Table '{table_name}' not found in workbook")
 
 
-def extract_tickers_and_start(df: pd.DataFrame) -> tuple[list[str], date]:
+def extract_tickers_start_and_hints(df: pd.DataFrame) -> tuple[list[str], date, dict[str, ContractHint]]:
     if "Ticker" not in df.columns:
         raise ValueError("tbl_TradeLog must have a 'Ticker' column")
-    tickers = sorted({
-        str(t).strip().upper()
-        for t in df["Ticker"].dropna()
-        if str(t).strip() and not str(t).startswith("=")
-    })
+
+    def normalize_ticker(value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        text = str(value).strip().upper()
+        return "" if text in {"", "NAN"} or text.startswith("=") else text
+
+    work = df.copy()
+    work["Ticker"] = work["Ticker"].apply(normalize_ticker)
+    work = work[work["Ticker"].ne("")]
+    tickers = sorted(set(work["Ticker"]))
 
     start_candidates = []
     for col in ("Date",):
-        if col in df.columns:
-            parsed = pd.to_datetime(df[col], errors="coerce").dropna()
+        if col in work.columns:
+            parsed = pd.to_datetime(work[col], errors="coerce").dropna()
             if not parsed.empty:
                 start_candidates.append(parsed.min().date())
     start_date = min(start_candidates) if start_candidates else date.today().replace(year=date.today().year - 1)
-    return tickers, start_date
+
+    hints: dict[str, ContractHint] = {}
+    if "exchange" in work.columns or "currency" in work.columns:
+        if "Date" in work.columns:
+            work["Date"] = pd.to_datetime(work["Date"], errors="coerce")
+            work = work.sort_values("Date")
+        for _, row in work.iterrows():
+            ticker = row["Ticker"]
+            exchange = str(row.get("exchange") or "").strip().upper()
+            currency = str(row.get("currency") or "").strip().upper()
+            if not exchange and not currency:
+                continue
+            hints[ticker] = ContractHint(exchange=exchange, currency=currency)
+
+    return tickers, start_date, hints
 
 
-def fetch_ib_series(ib: IB, ticker: str, start_date: date) -> pd.DataFrame:
-    contract = Stock(ticker, "SMART", "USD")
-    ib.qualifyContracts(contract)
+def _candidate_contracts(ticker: str, hint: ContractHint | None) -> list[Stock]:
+    candidates: list[tuple[str, str]] = []
+    if hint:
+        if hint.exchange and hint.currency:
+            candidates.append((hint.exchange, hint.currency))
+        elif hint.exchange:
+            candidates.append((hint.exchange, "USD"))
+        elif hint.currency:
+            candidates.append(("SMART", hint.currency))
+        if hint.currency:
+            candidates.append(("SMART", hint.currency))
+    candidates.append(("SMART", "USD"))
+
+    dedup: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        dedup.append(item)
+    return [Stock(ticker, exchange, currency) for exchange, currency in dedup]
+
+
+def fetch_ib_series(ib: IB, ticker: str, start_date: date, hint: ContractHint | None = None) -> pd.DataFrame:
     duration_days = max((date.today() - start_date).days + 5, 10)
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime="",
-        durationStr=f"{duration_days} D",
-        barSizeSetting="1 day",
-        whatToShow="ADJUSTED_LAST",
-        useRTH=True,
-        formatDate=1,
-    )
-    df = util.df(bars)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df[["date", "open", "high", "low", "close", "volume"]].copy()
-    df.columns = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    df["Date"] = pd.to_datetime(df["Date"]).dt.date
-    df = df[df["Date"] >= start_date]
-    df["Adj_Close"] = df["Close"]
-    df["Ticker"] = ticker
-    return df[MARKET_HEADERS]
+    if duration_days > 365:
+        duration_str = f"{(duration_days + 364) // 365} Y"
+    else:
+        duration_str = f"{duration_days} D"
+    for contract in _candidate_contracts(ticker, hint):
+        try:
+            qualified = ib.qualifyContracts(contract)
+            if not qualified:
+                continue
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=duration_str,
+                barSizeSetting="1 day",
+                whatToShow="ADJUSTED_LAST",
+                useRTH=True,
+                formatDate=1,
+            )
+        except Exception:
+            continue
+
+        df = util.df(bars)
+        if df is None or df.empty:
+            continue
+        df = df[["date", "open", "high", "low", "close", "volume"]].copy()
+        df.columns = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        df["Date"] = pd.to_datetime(df["Date"]).dt.date
+        df = df[df["Date"] >= start_date]
+        df["Adj_Close"] = df["Close"]
+        df["Ticker"] = ticker
+        if not df.empty:
+            return df[MARKET_HEADERS]
+    return pd.DataFrame()
 
 
 def fetch_yf_series(ticker: str, start_date: date) -> pd.DataFrame:
@@ -225,7 +286,7 @@ def main() -> None:
 
     wb = load_workbook(cfg.workbook)
     trade_df, _, _ = read_table_dataframe(wb, "tbl_TradeLog")
-    tickers, start_date = extract_tickers_and_start(trade_df)
+    tickers, start_date, contract_hints = extract_tickers_start_and_hints(trade_df)
     if not tickers:
         write_market_table(wb, pd.DataFrame())
         wb.save(cfg.workbook)
@@ -239,7 +300,7 @@ def main() -> None:
     for ticker in tickers:
         series = pd.DataFrame()
         try:
-            series = fetch_ib_series(ib, ticker, start_date)
+            series = fetch_ib_series(ib, ticker, start_date, contract_hints.get(ticker))
         except Exception as exc:
             print(f"IB fetch failed for {ticker}: {exc}")
 

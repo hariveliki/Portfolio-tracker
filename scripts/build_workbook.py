@@ -51,7 +51,9 @@ def load_output_path(config_path: Path = DEFAULT_CONFIG_PATH) -> Path:
         return DEFAULT_OUTPUT_PATH
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
-    return Path((raw.get("paths") or {}).get("workbook_output", str(DEFAULT_OUTPUT_PATH)))
+    return Path(
+        (raw.get("paths") or {}).get("workbook_output", str(DEFAULT_OUTPUT_PATH))
+    )
 
 
 def _apply_sheet_defaults(ws) -> None:
@@ -62,7 +64,9 @@ def _apply_sheet_defaults(ws) -> None:
 def _autosize_columns(ws) -> None:
     for col in ws.columns:
         max_len = max(len(str(cell.value or "")) for cell in col)
-        ws.column_dimensions[get_column_letter(col[0].column)].width = max(14, min(40, max_len + 4))
+        ws.column_dimensions[get_column_letter(col[0].column)].width = max(
+            14, min(40, max_len + 4)
+        )
 
 
 def _style_header_row(ws) -> None:
@@ -74,7 +78,9 @@ def _style_header_row(ws) -> None:
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
-def _make_table(ws, table_name: str, headers: list[str], seed_row: list | None = None) -> Table:
+def _make_table(
+    ws, table_name: str, headers: list[str], seed_row: list | None = None
+) -> Table:
     ws.append(headers)
     ws.append(seed_row if seed_row else [""] * len(headers))
     ref = f"A1:{get_column_letter(len(headers))}{ws.max_row}"
@@ -92,10 +98,16 @@ def _apply_pos_neg_cf(ws, col_letters: list[str], max_row: int = 5000) -> None:
     for letter in col_letters:
         rng = f"{letter}2:{letter}{max_row}"
         ws.conditional_formatting.add(
-            rng, CellIsRule(operator="greaterThan", formula=["0"], fill=GREEN_FILL, font=GREEN_FONT),
+            rng,
+            CellIsRule(
+                operator="greaterThan", formula=["0"], fill=GREEN_FILL, font=GREEN_FONT
+            ),
         )
         ws.conditional_formatting.add(
-            rng, CellIsRule(operator="lessThan", formula=["0"], fill=RED_FILL, font=RED_FONT),
+            rng,
+            CellIsRule(
+                operator="lessThan", formula=["0"], fill=RED_FILL, font=RED_FONT
+            ),
         )
 
 
@@ -132,17 +144,40 @@ def build_workbook(output_path: Path | None = None) -> Path:
         wb["Trade_Log"],
         "tbl_TradeLog",
         [
-            "Date", "IB_ExecId", "Ticker", "Action", "Shares", "Price", "Commission",
-            "permId", "account", "exchange", "currency",
-            "Gross_Value", "Net_Cost", "Signed_Shares", "Signed_Cash", "Cash_Balance",
+            "Date",
+            "IB_ExecId",
+            "Ticker",
+            "Action",
+            "Shares",
+            "Price",
+            "Commission",
+            "permId",
+            "account",
+            "exchange",
+            "currency",
+            "Gross_Value",
+            "Net_Cost",
+            "Signed_Shares",
+            "Signed_Cash",
+            "Cash_Balance",
         ],
         [
-            "", "", "", "", 0, 0, 0, "", "", "", "",
-            "=[@Shares]*[@Price]",
-            '=IF(OR(UPPER([@Action])="BUY",UPPER([@Action])="BOT"),[@Gross_Value]+[@Commission],[@Gross_Value]-[@Commission])',
-            '=IF(OR(UPPER([@Action])="BUY",UPPER([@Action])="BOT"),[@Shares],-[@Shares])',
-            "=-[@Signed_Shares]*[@Price]-[@Commission]",
-            "=StartCapital+SUM(INDEX(tbl_TradeLog[Signed_Cash],1):[@Signed_Cash])",
+            "",
+            "",
+            "",
+            "",
+            0,
+            0,
+            0,
+            "",
+            "",
+            "",
+            "",
+            "=E2*F2",
+            '=IF(OR(UPPER(D2)="BUY",UPPER(D2)="BOT"),L2+G2,L2-G2)',
+            '=IF(OR(UPPER(D2)="BUY",UPPER(D2)="BOT"),E2,-E2)',
+            "=-N2*F2-G2",
+            "=StartCapital+SUM($O$2:O2)",
         ],
     )
     _apply_pos_neg_cf(wb["Trade_Log"], ["O"])
@@ -175,16 +210,34 @@ def build_workbook(output_path: Path | None = None) -> Path:
         wb["Positions"],
         "tbl_Positions",
         [
-            "Ticker", "Company", "Sector", "Region", "Units", "Avg_Cost", "Last_Price",
-            "Day_Change_Pct", "Cost_Basis", "Market_Value", "Unrealized_PnL", "PnL_Pct", "Weight",
+            "Ticker",
+            "Company",
+            "Sector",
+            "Region",
+            "Units",
+            "Avg_Cost",
+            "Last_Price",
+            "Day_Change_Pct",
+            "Cost_Basis",
+            "Market_Value",
+            "Unrealized_PnL",
+            "PnL_Pct",
+            "Weight",
         ],
         [
-            "", "", "", "", 0, 0, 0, 0,
-            "=[@Units]*[@Avg_Cost]",
-            "=[@Units]*[@Last_Price]",
-            "=[@Market_Value]-[@Cost_Basis]",
-            "=IFERROR([@Unrealized_PnL]/[@Cost_Basis],0)",
-            "=IFERROR([@Market_Value]/SUM(tbl_Positions[Market_Value]),0)",
+            "",
+            "",
+            "",
+            "",
+            0,
+            0,
+            0,
+            0,
+            "=E2*F2",
+            "=E2*G2",
+            "=J2-I2",
+            "=IFERROR(K2/I2,0)",
+            "=IFERROR(J2/SUM($J:$J),0)",
         ],
     )
     _apply_pos_neg_cf(wb["Positions"], ["H", "K", "L"])
@@ -193,16 +246,24 @@ def build_workbook(output_path: Path | None = None) -> Path:
         wb["Equity_Curve"],
         "tbl_EquityCurve",
         [
-            "Date", "Portfolio_Value", "Cash_Balance", "NAV", "Daily_Return",
-            "Cumulative_Return", "Peak_NAV", "Drawdown",
+            "Date",
+            "Portfolio_Value",
+            "Cash_Balance",
+            "NAV",
+            "Daily_Return",
+            "Cumulative_Return",
+            "Peak_NAV",
+            "Drawdown",
         ],
         [
-            "", 0, 0,
-            "=[@Portfolio_Value]+[@Cash_Balance]",
-            "=IFERROR([@NAV]/OFFSET([@NAV],-1,0)-1,0)",
-            "=IFERROR([@NAV]/INDEX(tbl_EquityCurve[NAV],1)-1,0)",
-            "=MAX(INDEX(tbl_EquityCurve[NAV],1):[@NAV])",
-            "=IFERROR([@NAV]/[@Peak_NAV]-1,0)",
+            "",
+            0,
+            0,
+            "=B2+C2",
+            "=IFERROR(D2/D1-1,0)",
+            "=IFERROR(D2/$D$2-1,0)",
+            "=MAX($D$2:D2)",
+            "=IFERROR(D2/G2-1,0)",
         ],
     )
     _apply_pos_neg_cf(wb["Equity_Curve"], ["E", "F", "H"])
@@ -213,8 +274,8 @@ def build_workbook(output_path: Path | None = None) -> Path:
         ["Sector", "Market_Value", "Weight"],
         [
             "",
-            '=SUMIFS(tbl_Positions[Market_Value],tbl_Positions[Sector],[@Sector])',
-            "=IFERROR([@Market_Value]/SUM(tbl_SectorExposure[Market_Value]),0)",
+            "=SUMIFS(Positions!$J:$J,Positions!$C:$C,A2)",
+            "=IFERROR(B2/SUM($B:$B),0)",
         ],
     )
 
@@ -224,8 +285,8 @@ def build_workbook(output_path: Path | None = None) -> Path:
         ["Region", "Market_Value", "Weight"],
         [
             "",
-            '=SUMIFS(tbl_Positions[Market_Value],tbl_Positions[Region],[@Region])',
-            "=IFERROR([@Market_Value]/SUM(tbl_GeoExposure[Market_Value]),0)",
+            "=SUMIFS(Positions!$J:$J,Positions!$D:$D,A2)",
+            "=IFERROR(B2/SUM($B:$B),0)",
         ],
     )
 
@@ -239,18 +300,44 @@ def build_workbook(output_path: Path | None = None) -> Path:
     ws["B2"].alignment = Alignment(horizontal="left")
 
     kpis = [
-        ("B4", "NAV", "C4", "=IFERROR(TAKE(tbl_EquityCurve[NAV],-1),0)", "#,##0.00"),
-        ("B5", "Total Return", "C5", "=IFERROR(TAKE(tbl_EquityCurve[Cumulative_Return],-1),0)", "0.00%"),
-        ("B6", "Daily Return", "C6", "=IFERROR(TAKE(tbl_EquityCurve[Daily_Return],-1),0)", "0.00%"),
+        ("B4", "NAV", "C4", '=IFERROR(LOOKUP(2,1/(Equity_Curve!$D:$D<>""),Equity_Curve!$D:$D),0)', "#,##0.00"),
         (
-            "B7", "Sharpe Ratio", "C7",
-            "=IFERROR((AVERAGE(tbl_EquityCurve[Daily_Return])*252-RiskFreeRate)"
-            "/(STDEV(tbl_EquityCurve[Daily_Return])*SQRT(252)),0)",
+            "B5",
+            "Total Return",
+            "C5",
+            '=IFERROR(LOOKUP(2,1/(Equity_Curve!$F:$F<>""),Equity_Curve!$F:$F),0)',
+            "0.00%",
+        ),
+        (
+            "B6",
+            "Daily Return",
+            "C6",
+            '=IFERROR(LOOKUP(2,1/(Equity_Curve!$E:$E<>""),Equity_Curve!$E:$E),0)',
+            "0.00%",
+        ),
+        (
+            "B7",
+            "Sharpe Ratio",
+            "C7",
+            "=IFERROR((AVERAGE(Equity_Curve!$E:$E)*252-RiskFreeRate)"
+            "/(STDEV(Equity_Curve!$E:$E)*SQRT(252)),0)",
             "0.00",
         ),
-        ("B8", "Max Drawdown", "C8", "=IFERROR(MIN(tbl_EquityCurve[Drawdown]),0)", "0.00%"),
-        ("B9", "VaR (95% Daily)", "C9", "=IFERROR(PERCENTILE(tbl_EquityCurve[Daily_Return],0.05),0)", "0.00%"),
-        ("B10", "# Positions", "C10", '=COUNTIF(tbl_Positions[Units],">"&0)', "0"),
+        (
+            "B8",
+            "Max Drawdown",
+            "C8",
+            "=IFERROR(MIN(Equity_Curve!$H:$H),0)",
+            "0.00%",
+        ),
+        (
+            "B9",
+            "VaR (95% Daily)",
+            "C9",
+            "=IFERROR(PERCENTILE(Equity_Curve!$E:$E,0.05),0)",
+            "0.00%",
+        ),
+        ("B10", "# Positions", "C10", '=COUNTIF(Positions!$E:$E,">0")', "0"),
         ("B11", "Start Date", "C11", "=StartDate", "@"),
     ]
     for label_cell, label, value_cell, formula, fmt in kpis:

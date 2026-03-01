@@ -199,6 +199,72 @@ def append_rows(workbook_path: Path, rows: list[dict[str, Any]]) -> int:
     return len(rows)
 
 
+def trade_log_has_data(workbook_path: Path) -> bool:
+    wb, ws, table = find_trade_table(workbook_path)
+    headers, start_col, start_row, _, end_row = read_table_headers(ws, table)
+    if "Ticker" not in headers:
+        wb.close()
+        return False
+    ticker_col = start_col + headers.index("Ticker")
+    for row in range(start_row + 1, end_row + 1):
+        val = ws.cell(row=row, column=ticker_col).value
+        if val is not None and str(val).strip() and not str(val).startswith("="):
+            wb.close()
+            return True
+    wb.close()
+    return False
+
+
+def read_start_date(workbook_path: Path) -> str:
+    wb = load_workbook(workbook_path)
+    if "Settings" in wb.sheetnames:
+        ws = wb["Settings"]
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=2, values_only=True):
+            if row[0] and str(row[0]).strip() == "Start Date" and row[1]:
+                wb.close()
+                return str(row[1]).strip()
+    wb.close()
+    return datetime.now(tz=UTC).date().isoformat()
+
+
+def bootstrap_from_positions(ib: IB, workbook_path: Path) -> int:
+    positions = ib.positions()
+    if not positions:
+        print("No IBKR positions to bootstrap from")
+        return 0
+
+    start_date = read_start_date(workbook_path)
+    print(f"Bootstrapping {len(positions)} positions into Trade_Log (date={start_date})")
+
+    rows: list[dict[str, Any]] = []
+    for pos in positions:
+        symbol = getattr(pos.contract, "symbol", "")
+        qty = float(pos.position)
+        if not symbol or qty == 0:
+            continue
+        avg_cost = float(pos.avgCost)
+        multiplier = float(getattr(pos.contract, "multiplier", 1) or 1)
+        price_per_share = avg_cost / multiplier if multiplier else avg_cost
+
+        rows.append({
+            "IB_ExecId": f"BOOTSTRAP_{symbol}",
+            "Date": start_date,
+            "Ticker": symbol,
+            "Action": "BUY" if qty > 0 else "SELL",
+            "Shares": abs(qty),
+            "Price": round(price_per_share, 6),
+            "Commission": 0,
+            "permId": "",
+            "account": getattr(pos, "account", ""),
+            "exchange": getattr(pos.contract, "exchange", "SMART"),
+            "currency": getattr(pos.contract, "currency", "USD"),
+        })
+
+    inserted = append_rows(workbook_path, rows)
+    print(f"Bootstrapped {inserted} positions into Trade_Log")
+    return inserted
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "portfolio.yaml")
@@ -238,6 +304,9 @@ def main() -> None:
         if inserted > 0:
             state["last_sync_utc"] = (max_seen_ts or datetime.now(tz=UTC)).isoformat().replace("+00:00", "Z")
             save_state(state_path, state)
+
+        if not trade_log_has_data(config.workbook_path):
+            bootstrap_from_positions(ib, config.workbook_path)
     finally:
         if ib.isConnected():
             ib.disconnect()
