@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import yaml
 import yfinance as yf
 from ib_insync import IB, Stock
@@ -20,6 +23,15 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 DEFAULT_CONFIG = "config/portfolio.yaml"
 REF_HEADERS = ["Ticker", "Name", "Sector", "Industry", "Region", "Currency", "Beta"]
+EXPOSURE_HEADERS = ["Ticker", "Dimension", "Bucket", "Weight"]
+
+# Yahoo/iShares sector names -> GICS names; keys are lower-case without spaces/underscores.
+YF_TO_GICS = {
+    "realestate": "Real Estate", "consumercyclical": "Consumer Discretionary",
+    "basicmaterials": "Materials", "consumerdefensive": "Consumer Staples",
+    "technology": "Information Technology", "financialservices": "Financials",
+    "healthcare": "Health Care", "communication": "Communication Services",
+}
 
 HEADER_FILL = PatternFill(start_color="1C2541", end_color="1C2541", fill_type="solid")
 HEADER_FONT = Font(name="Segoe UI", color="FFFFFF", bold=True, size=10)
@@ -35,6 +47,7 @@ class RefreshConfig:
     ib_host: str
     ib_port: int
     ib_client_id: int
+    instruments: dict[str, dict[str, Any]]
 
 
 def load_yaml_config(config_path: Path) -> dict[str, Any]:
@@ -61,46 +74,50 @@ def parse_args() -> RefreshConfig:
         ib_host=args.ib_host or os.getenv("IB_HOST", str(ib_cfg.get("host", "127.0.0.1"))),
         ib_port=args.ib_port or int(os.getenv("IB_PORT", str(ib_cfg.get("port", 7497)))),
         ib_client_id=args.ib_client_id or int(os.getenv("IB_CLIENT_ID", str(ib_cfg.get("client_id", 16)))),
+        instruments={str(k).upper(): v or {} for k, v in (raw_cfg.get("instruments") or {}).items()},
     )
 
 
-def extract_tickers(wb) -> list[str]:
+def extract_tickers(wb) -> dict[str, tuple[str, str]]:
+    """Return {ticker: (exchange, currency)} from the latest Trade_Log row per ticker."""
     for ws in wb.worksheets:
         if "tbl_TradeLog" not in ws.tables:
             continue
-        table = ws.tables["tbl_TradeLog"]
-        min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+        min_col, min_row, max_col, max_row = range_boundaries(ws.tables["tbl_TradeLog"].ref)
         values = list(ws.iter_rows(
             min_row=min_row, max_row=max_row,
             min_col=min_col, max_col=max_col,
             values_only=True,
         ))
         if len(values) < 2:
-            return []
+            return {}
         headers = [str(h) for h in values[0]]
         if "Ticker" not in headers:
-            return []
+            return {}
         idx = headers.index("Ticker")
-        return sorted({
-            str(r[idx]).strip().upper()
-            for r in values[1:]
-            if r[idx] is not None and str(r[idx]).strip() and not str(r[idx]).startswith("=")
-        })
-    return []
+        ex_idx = headers.index("exchange") if "exchange" in headers else None
+        ccy_idx = headers.index("currency") if "currency" in headers else None
+
+        def text(row, i):
+            return str(row[i] or "").strip().upper() if i is not None else ""
+
+        hints: dict[str, tuple[str, str]] = {}
+        for r in values[1:]:
+            ticker = str(r[idx] or "").strip().upper()
+            if not ticker or ticker.startswith("="):
+                continue
+            hints[ticker] = (text(r, ex_idx), text(r, ccy_idx))
+        return dict(sorted(hints.items()))
+    return {}
 
 
 def _blank_row(ticker: str) -> dict[str, Any]:
     return {"Ticker": ticker, "Name": "", "Sector": "", "Industry": "", "Region": "", "Currency": "", "Beta": ""}
 
 
-def _needs_ib_fallback(row: dict[str, Any]) -> bool:
-    # If both identity and currency are missing, yfinance was not useful.
-    return not row.get("Name") and not row.get("Currency")
-
-
-def fetch_reference_yf(ticker: str) -> dict[str, Any]:
+def fetch_reference_yf(ticker: str, symbol: str) -> dict[str, Any]:
     try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(symbol).info
     except Exception as exc:
         print(f"  Warning: yfinance lookup failed for {ticker}: {exc}")
         return _blank_row(ticker)
@@ -120,35 +137,70 @@ def fetch_reference_yf(ticker: str) -> dict[str, Any]:
     return row
 
 
-def fetch_reference_ibkr(ib: IB, ticker: str) -> dict[str, Any]:
-    contract = Stock(ticker, "SMART", "USD")
-    ib.qualifyContracts(contract)
-    details = ib.reqContractDetails(contract)
-    if not details:
-        return _blank_row(ticker)
+def gics(name: str) -> str:
+    key = name.lower().replace(" ", "").replace("_", "")
+    return YF_TO_GICS.get(key, name)
 
-    detail = details[0]
-    # IBKR uses CUSIP-like market names; keep mapping conservative and stable.
-    region = detail.contract.primaryExchange or detail.contract.exchange or ""
+
+def fetch_ishares_weights(url: str) -> dict[str, dict[str, float]]:
+    """Sector and region weights (%) summed from an iShares holdings CSV."""
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        lines = response.read().decode("utf-8-sig").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("Ticker,"))
+    df = pd.read_csv(io.StringIO("\n".join(lines[start:])), usecols=["Sector", "Location", "Weight (%)"])
+    df["Weight (%)"] = pd.to_numeric(df["Weight (%)"], errors="coerce")
+    df = df[df["Weight (%)"] > 0]
+    df["Sector"] = df["Sector"].map(gics)
     return {
-        "Ticker": ticker,
-        "Name": detail.longName or "",
-        "Sector": detail.industry or "",
-        "Industry": detail.category or detail.subcategory or "",
-        "Region": region,
-        "Currency": detail.contract.currency or "",
-        "Beta": "",
+        "Sector": df.groupby("Sector")["Weight (%)"].sum().to_dict(),
+        "Region": df.groupby("Location")["Weight (%)"].sum().to_dict(),
     }
 
 
-def write_reference_table(wb, rows: list[dict[str, Any]], table_name: str = "tbl_ReferenceData") -> None:
-    target_ws = None
-    for ws in wb.worksheets:
-        if table_name in ws.tables:
-            target_ws = ws
-            break
-    if target_ws is None:
-        target_ws = wb["Reference_Data"] if "Reference_Data" in wb.sheetnames else wb.create_sheet("Reference_Data")
+def fetch_fund_sectors(symbol: str) -> dict[str, float]:
+    """Sector weights of an ETF as Yahoo reports them; empty for stocks and bond funds."""
+    try:
+        weights = yf.Ticker(symbol).funds_data.sector_weightings or {}
+    except Exception:
+        return {}
+    return {gics(k.replace("_", " ").title()): float(v) for k, v in weights.items() if v}
+
+
+def build_exposure(ticker: str, row: dict[str, Any], symbol: str, override: dict[str, Any]) -> list[dict[str, Any]]:
+    """Look-through rows (Ticker, Dimension, Bucket, Weight); every ticker sums to 1 per dimension."""
+    fund: dict[str, dict[str, float]] = {}
+    if override.get("holdings_url"):
+        try:
+            fund = fetch_ishares_weights(override["holdings_url"])
+        except Exception as exc:
+            print(f"    Warning: iShares holdings failed for {ticker}: {exc}")
+    sectors = (override.get("sectors") or fund.get("Sector")
+               or ({gics(row["Sector"]): 1.0} if row["Sector"] else fetch_fund_sectors(symbol)))
+    regions = override.get("regions") or fund.get("Region") or ({row["Region"]: 1.0} if row["Region"] else {})
+    rows = []
+    for dimension, weights in (("Sector", sectors), ("Region", regions)):
+        total = sum(weights.values())
+        if total <= 0:
+            print(f"    Warning: no {dimension.lower()} data for {ticker}")
+            weights, total = {"Unclassified": 1.0}, 1.0
+        rows += [{"Ticker": ticker, "Dimension": dimension, "Bucket": b, "Weight": w / total}
+                 for b, w in weights.items()]
+    return rows
+
+
+def fetch_reference_ibkr(ib: IB, ticker: str, exchange: str, currency: str) -> dict[str, Any]:
+    """Name and currency as IBKR shows them; the contract is looked up via the Trade_Log hint."""
+    candidates = [(exchange or "SMART", currency or "USD"), ("SMART", currency or "USD"), ("SMART", "USD")]
+    for ex, ccy in dict.fromkeys(candidates):
+        details = ib.reqContractDetails(Stock(ticker, ex, ccy))
+        if details:
+            return {"Name": details[0].longName or "", "Currency": details[0].contract.currency or ""}
+    return {}
+
+
+def write_table(wb, rows: list[dict[str, Any]], table_name: str, sheet_name: str, headers: list[str]) -> None:
+    target_ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
 
     for row in target_ws.iter_rows(
         min_row=1, max_row=max(target_ws.max_row, 1),
@@ -159,23 +211,23 @@ def write_reference_table(wb, rows: list[dict[str, Any]], table_name: str = "tbl
     if table_name in target_ws.tables:
         del target_ws.tables[table_name]
 
-    for ci, h in enumerate(REF_HEADERS, 1):
+    for ci, h in enumerate(headers, 1):
         cell = target_ws.cell(row=1, column=ci, value=h)
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     if not rows:
-        for ci in range(1, len(REF_HEADERS) + 1):
+        for ci in range(1, len(headers) + 1):
             target_ws.cell(row=2, column=ci, value="")
         last_row = 2
     else:
         for ri, row_data in enumerate(rows, 2):
-            for ci, h in enumerate(REF_HEADERS, 1):
+            for ci, h in enumerate(headers, 1):
                 target_ws.cell(row=ri, column=ci, value=row_data.get(h, ""))
         last_row = len(rows) + 1
 
-    ref = f"A1:{get_column_letter(len(REF_HEADERS))}{last_row}"
+    ref = f"A1:{get_column_letter(len(headers))}{last_row}"
     table = Table(displayName=table_name, ref=ref)
     table.tableStyleInfo = TABLE_STYLE
     target_ws.add_table(table)
@@ -195,49 +247,40 @@ def main() -> None:
         raise FileNotFoundError(f"Workbook not found: {workbook_path}")
 
     wb = load_workbook(workbook_path)
-    tickers = extract_tickers(wb)
-    if not tickers:
+    hints = extract_tickers(wb)
+    if not hints:
         print("No tickers found in Trade_Log, skipping reference data refresh")
         wb.close()
         return
 
-    print(f"Fetching reference data for {len(tickers)} tickers...")
-    rows = []
+    print(f"Fetching reference data for {len(hints)} tickers...")
     ib = IB()
-    ib_connected = False
-    for ticker in tickers:
-        print(f"  {ticker}...")
-        row = fetch_reference_yf(ticker)
-        if _needs_ib_fallback(row):
-            print(f"    yfinance incomplete for {ticker}; trying IBKR fallback")
-            if not ib_connected:
-                try:
-                    ib.connect(cfg.ib_host, cfg.ib_port, clientId=cfg.ib_client_id)
-                    ib_connected = True
-                except Exception as exc:
-                    print(f"    Warning: failed to connect to IBKR for fallback: {exc}")
-            if ib_connected:
-                try:
-                    ib_row = fetch_reference_ibkr(ib, ticker)
-                    row = {
-                        "Ticker": ticker,
-                        "Name": row.get("Name") or ib_row.get("Name", ""),
-                        "Sector": row.get("Sector") or ib_row.get("Sector", ""),
-                        "Industry": row.get("Industry") or ib_row.get("Industry", ""),
-                        "Region": row.get("Region") or ib_row.get("Region", ""),
-                        "Currency": row.get("Currency") or ib_row.get("Currency", ""),
-                        "Beta": row.get("Beta") if row.get("Beta") not in (None, "") else ib_row.get("Beta", ""),
-                    }
-                except Exception as exc:
-                    print(f"    Warning: IBKR fallback failed for {ticker}: {exc}")
-        rows.append(row)
+    try:
+        ib.connect(cfg.ib_host, cfg.ib_port, clientId=cfg.ib_client_id)
+    except Exception as exc:
+        print(f"  Warning: IBKR unavailable, names will come from yfinance only: {exc}")
 
-    if ib_connected:
+    rows, exposure = [], []
+    for ticker, (exchange, currency) in hints.items():
+        print(f"  {ticker}...")
+        override = cfg.instruments.get(ticker, {})
+        symbol = override.get("yahoo", ticker)
+        row = fetch_reference_yf(ticker, symbol)
+        if ib.isConnected():
+            try:
+                row.update({k: v for k, v in fetch_reference_ibkr(ib, ticker, exchange, currency).items() if v})
+            except Exception as exc:
+                print(f"    Warning: IBKR lookup failed for {ticker}: {exc}")
+        rows.append(row)
+        exposure += build_exposure(ticker, row, symbol, override)
+
+    if ib.isConnected():
         ib.disconnect()
 
-    write_reference_table(wb, rows)
+    write_table(wb, rows, "tbl_ReferenceData", "Reference_Data", REF_HEADERS)
+    write_table(wb, exposure, "tbl_ReferenceExposure", "Reference_Exposure", EXPOSURE_HEADERS)
     wb.save(workbook_path)
-    print(f"Updated tbl_ReferenceData for {len(tickers)} tickers in {workbook_path}")
+    print(f"Updated tbl_ReferenceData for {len(hints)} tickers in {workbook_path}")
 
 
 if __name__ == "__main__":

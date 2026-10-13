@@ -37,9 +37,13 @@ SHEETS = [
     "Equity_Curve",
     "Sector_Exposure",
     "Geographic_Exposure",
+    "Currency_Exposure",
+    "Rebalancing",
+    "Contribution",
     "Trade_Log",
     "Market_Data",
     "Reference_Data",
+    "Reference_Exposure",
     "Daily_Units",
     "Daily_Cash",
     "Settings",
@@ -130,6 +134,8 @@ def build_workbook(output_path: Path | None = None) -> Path:
     ws["B4"] = 0.02
     ws["A5"] = "Base Currency"
     ws["B5"] = "USD"
+    ws["A6"] = "Benchmark"
+    ws["B6"] = "URTH"
     _style_header_row(ws)
     _autosize_columns(ws)
     ws.freeze_panes = "B2"
@@ -192,6 +198,12 @@ def build_workbook(output_path: Path | None = None) -> Path:
         wb["Reference_Data"],
         "tbl_ReferenceData",
         ["Ticker", "Name", "Sector", "Industry", "Region", "Currency", "Beta"],
+    )
+
+    _make_table(
+        wb["Reference_Exposure"],
+        "tbl_ReferenceExposure",
+        ["Ticker", "Dimension", "Bucket", "Weight"],
     )
 
     _make_table(
@@ -274,7 +286,7 @@ def build_workbook(output_path: Path | None = None) -> Path:
         ["Sector", "Market_Value", "Weight"],
         [
             "",
-            "=SUMIFS(Positions!$J:$J,Positions!$C:$C,A2)",
+            "",
             "=IFERROR(B2/SUM($B:$B),0)",
         ],
     )
@@ -285,7 +297,7 @@ def build_workbook(output_path: Path | None = None) -> Path:
         ["Region", "Market_Value", "Weight"],
         [
             "",
-            "=SUMIFS(Positions!$J:$J,Positions!$D:$D,A2)",
+            "",
             "=IFERROR(B2/SUM($B:$B),0)",
         ],
     )

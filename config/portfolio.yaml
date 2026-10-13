@@ -10,3 +10,36 @@ portfolio:
 
 paths:
   workbook_output: "output/portfolio_workbook.xlsx"
+
+# Look-through data per ticker, in order of precedence:
+#   sectors / regions  manual weights (each should sum to 1)
+#   holdings_url       iShares holdings CSV (sector + country of every holding)
+#   otherwise          Yahoo Finance (`yahoo` is its symbol; IBKR local symbols differ)
+# iShares product pages: the "latest-holdings.csv" link on the .com/uk site, or the
+# ".ajax?fileType=csv" link on the .com/ch site. A dead URL falls back to "Unclassified".
+instruments:
+  IDUS:
+    yahoo: "IDUS.L"
+    holdings_url: "https://www.ishares.com/uk/individual/en/products/253743/ishares-core-s-p-500-ucits-etf/latest-holdings.csv"
+  CHSPI:
+    yahoo: "CHSPI.SW"
+    holdings_url: "https://www.ishares.com/ch/individual/en/products/264107/ishares-spi-ch-fund/1495092304805.ajax?fileType=csv&fileName=CHSPI_holdings&dataType=fund"
+  VAW:  # Vanguard, not iShares
+    yahoo: "VAW"
+    regions: {United States: 1.0}
+  IMEU:
+    yahoo: "IMEU.AS"
+    holdings_url: "https://www.ishares.com/uk/individual/en/products/251860/ishares-msci-europe-ucits-etf-inc-fund/latest-holdings.csv"
+  IEMM:
+    yahoo: "IEMM.AS"
+    holdings_url: "https://www.ishares.com/uk/individual/en/products/251857/ishares-msci-emerging-markets-ucits-etf-inc-fund/latest-holdings.csv"
+  CSPXJ:
+    yahoo: "CSPXJ.SW"
+    holdings_url: "https://www.ishares.com/uk/individual/en/products/253735/ishares-msci-pacific-ex-japan-ucits-etf-acc-fund/latest-holdings.csv"
+  WSML:
+    yahoo: "WSML.L"
+    holdings_url: "https://www.ishares.com/uk/individual/en/products/296576/ishares-msci-world-small-cap-ucits-etf/latest-holdings.csv"
+  AGGS:
+    yahoo: "AGGS.SW"
+    sectors: {Bonds: 1.0}  # holdings sectors would be bond types (Treasuries, Corporates, ...)
+    holdings_url: "https://www.ishares.com/ch/individual/en/products/295830/ishares-core-global-aggregate-bond-ucits-etf/1495092304805.ajax?fileType=csv&fileName=AGGS_holdings&dataType=fund"
